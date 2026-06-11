@@ -1,20 +1,21 @@
 
 import cv2
 import time
+import numpy as np
 from flask import Flask, Response, render_template_string
 from ultralytics import YOLO
 
 from cam_main_helpers import (
-    check_approachability,
-    distance_point_to_line
+    process_frame
 )
 
 # ==========================================================
 # Configuration
 # ==========================================================
 
-CAMERA_NUMBER = 1
+CAMERA_NUMBER = 0
 CONF_THRESHOLD = 0.7
+IS_360 = True
 
 model = YOLO("yolo26n-pose.pt")
 
@@ -39,10 +40,10 @@ HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>YOLO Pose Stream</title>
+    <title>Gaze Detector Stream</title>
 </head>
 <body>
-    <h1>YOLO Pose Stream</h1>
+    <h1>Gaze Detector Stream</h1>
 
     <img src="/video_feed" width="960">
 
@@ -59,134 +60,30 @@ def generate_frames():
     while cap.isOpened():
 
         success, frame = cap.read()
-
         if not success:
-            print("Failed to read camera stream.")
+            print("Failed to read camera stream: check CAMERA_NUMBER.")
             time.sleep(0.01)
             continue
 
+        if IS_360:
+            h, w = frame.shape[:2]
+
+            top_frame = frame[:h//2, :]
+            bottom_frame = frame[h//2:, :]
+
+            top_results = model(top_frame, verbose=False, classes=[0])[0]
+            bottom_results= model(bottom_frame, verbose=False, classes=[0])[0]
+        else:
+            results = model(frame, verbose=False, classes=[0])[0]
+
         frame_timestamp = time.time()
 
-        results = model(
-            frame,
-            verbose=False,
-            classes=[0]
-        )[0]
-
-        processed_data = []
-
-        if results.keypoints is not None:
-
-            boxes = results.boxes.xyxy.cpu().numpy()
-            confidences = results.boxes.conf.cpu().numpy()
-            kpts_list = results.keypoints.data.cpu().numpy()
-
-            for index, kpts in enumerate(kpts_list):
-
-                face_kpts = kpts[0:5]
-
-                approachable = check_approachability(
-                    face_kpts,
-                    frame,
-                    conf_thresh=CONF_THRESHOLD
-                )
-
-                face_serialized = [
-                    [float(x), float(y), float(conf)]
-                    for x, y, conf in face_kpts
-                ]
-
-                bbox = [float(x) for x in boxes[index]]
-
-                processed_data.append({
-                    "person_id": index,
-                    "bbox": bbox,
-                    "face_keypoints": face_serialized,
-                    "approachable": approachable,
-                    "timestamp": frame_timestamp
-                })
-
-                color = (
-                    (0, 255, 0)
-                    if approachable
-                    else (0, 0, 255)
-                )
-
-                cv2.rectangle(
-                    frame,
-                    (int(bbox[0]), int(bbox[1])),
-                    (int(bbox[2]), int(bbox[3])),
-                    color,
-                    2
-                )
-
-                if approachable:
-                    cv2.putText(
-                        frame,
-                        "APPROACHABLE",
-                        (25, frame.shape[0] - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.67,
-                        (0, 255, 0),
-                        2
-                    )
-
-                person_conf = confidences[index]
-
-                cv2.putText(
-                    frame,
-                    f"Person {person_conf:.2f}",
-                    (int(bbox[0]), int(bbox[1]) - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    2
-                )
-
-                for idx, pt in enumerate(face_serialized):
-
-                    x, y, conf = pt
-
-                    if conf < CONF_THRESHOLD:
-                        continue
-
-                    cv2.circle(
-                        frame,
-                        (int(x), int(y)),
-                        4,
-                        (255, 255, 0),
-                        -1
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"{face_names[idx]}",
-                        (int(x) + 5, int(y) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        (255, 255, 0),
-                        1
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"({x:.0f},{y:.0f})",
-                        (int(x) + 5, int(y) + 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.35,
-                        (255, 255, 255),
-                        1
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"{conf:.2f}",
-                        (int(x) + 5, int(y) - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.4,
-                        (67, 255, 67),
-                        1
-                    )
+        if IS_360:
+            process_frame(top_results, top_frame, conf_thresh=CONF_THRESHOLD)
+            process_frame(bottom_results, bottom_frame, conf_thresh=CONF_THRESHOLD)
+            frame = np.vstack((top_frame, bottom_frame))
+        else:
+            process_frame(results, frame, conf_thresh=CONF_THRESHOLD)
 
         ret, buffer = cv2.imencode(".jpg", frame)
 

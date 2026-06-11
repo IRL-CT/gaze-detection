@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import cv2
 import time
 import numpy as np
@@ -13,6 +14,7 @@ model = YOLO('yolo26n-pose.pt')
 CAMERA_NUMBER = 0 # 0 or 1 for WebCam
 CONF_THRESHOLD = 0.7
 IS_360 = True
+IMG_REDUC_FACTOR = 0.6
 
 cap = cv2.VideoCapture(CAMERA_NUMBER)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -20,16 +22,20 @@ cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cv2.namedWindow("Stream", cv2.WINDOW_NORMAL)
 
 while cap.isOpened():
-
     success, frame = cap.read()
+    
     if not success:
         print("Failed to read camera stream: check CAMERA_NUMBER.")
         time.sleep(0.01)
         continue
 
-    if IS_360:
-        h, w = frame.shape[:2]
+    h, w = frame.shape[:2]
 
+    if IMG_REDUC_FACTOR != 1:
+        h, w = int(h*IMG_REDUC_FACTOR), int(w*IMG_REDUC_FACTOR)
+        frame = cv2.resize(frame, (w, h))
+        
+    if IS_360:
         top_frame = frame[:h//2, :]
         bottom_frame = frame[h//2:, :]
 

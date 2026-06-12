@@ -15,6 +15,9 @@ def distance_point_to_line(p1, p2, p3):
     point_vec = p3 - p1
     
     # Perpendicular distance formula via 2D cross product & norm
+    line_vec = np.array([line_vec[0], line_vec[1], 0.0])
+    point_vec = np.array([point_vec[0], point_vec[1], 0.0])
+
     return abs(np.cross(line_vec, point_vec)) / np.linalg.norm(line_vec)
 
 def check_approachability(keypoints, image, conf_thresh=0.7):
@@ -53,6 +56,8 @@ def check_approachability(keypoints, image, conf_thresh=0.7):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.67, (0, 67, 255), 4)
                 if (ear_nose_dist/ear_dist) < 0.25:
                     return True
+            else:
+                return True
                 
     return False
 
@@ -110,7 +115,7 @@ def process_frame(results, frame, conf_thresh=0.7):
 # Configuration
 # ==========================================================
 
-CAMERA_NUMBER = 0
+CAMERA_NUMBER = "approachable.mov"
 CONF_THRESHOLD = 0.7
 IS_360 = True
 IMG_REDUC_FACTOR = 0.6

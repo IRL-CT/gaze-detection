@@ -1,0 +1,9 @@
+__pycache__/
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.mov
+*.avi
+venv/
+old/

@@ -10,8 +10,7 @@ from cam_main_helpers import process_frame
 # Load real-time YOLO Pose model (Nano version recommended for speed)
 model = YOLO('yolo26n-pose.pt')
 
-# TODO: connect & test w/Insta360, 360 view
-CAMERA_NUMBER = 0 # 0 or 1 for WebCam
+CAMERA_NUMBER = "docker/approachable.mov" # 0 or 1 for WebCam
 CONF_THRESHOLD = 0.7
 IS_360 = True
 IMG_REDUC_FACTOR = 0.6

@@ -1,6 +1,9 @@
 import cv2
 
 def get_available_cameras():
+    """
+    Prints all available camera options for CV2 Video Capture.
+    """
     available_cameras = []
     # Check for 5 cameras 
     for i in range(5):

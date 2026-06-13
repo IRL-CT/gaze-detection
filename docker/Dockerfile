@@ -15,8 +15,8 @@ RUN apt-get update && apt-get install -y \
 
 # 2. python deps
 RUN pip3 install --no-cache-dir \
+    "numpy<2" \
     flask \
-    numpy \
     ultralytics
 
 # 4. workspace

@@ -4,6 +4,7 @@ import cv2
 import rclpy
 import threading
 import numpy as np
+import time
 from ultralytics import YOLO
 from flask import Flask, Response, render_template_string
 from math import dist
@@ -11,6 +12,35 @@ from math import dist
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+
+CAMERA_NUMBER = "approachable.mov"
+# CAMERA_NUMBER = 0
+IS_ORIGINAL_FPS = False
+FRAME_RATE = 100
+
+# ==========================================================
+# Flask Configuration
+# ==========================================================
+app = Flask(__name__)
+
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Gaze Detector Stream</title>
+</head>
+<body>
+    <h1 style="text-align:center;">Gaze Detector Stream</h1>
+    <div style="display: flex; justify-content: center; margin: 10px;">
+        <img src="/video_feed" width="960">
+    </div>
+</body>
+</html>
+"""
+
+# Global variable to safely hold the latest processed frame JPEG bytes across threads
+latest_frame_bytes = None
+frame_lock = threading.Lock()
 
 def distance_point_to_line(p1, p2, p3):
     """
@@ -40,7 +70,6 @@ def check_approachability(keypoints, image, conf_thresh=0.7, reduc=1):
     r_ear = keypoints[4]
     
     # 1. Is nose visible?
-    # [x, y, confidence]
     if nose[2] < conf_thresh:
         return False
         
@@ -51,16 +80,16 @@ def check_approachability(keypoints, image, conf_thresh=0.7, reduc=1):
         
         if eye_distance > 0:
             nose_eyes_offset = abs(nose[0] - eye_center_x) / eye_distance
-            cv2.putText(image, f"Nose Offset: {nose_eyes_offset:.2f}", (25, image.shape[0] - 50*reduc),
+            cv2.putText(image, f"Nose Offset: {nose_eyes_offset:.2f}", (25, int(image.shape[0] - 50*reduc)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, (255, 255, 0), 2)
             if nose_eyes_offset > 0.15: 
                 return False
-        # 3. TODO: Check ears, nose, "collinear" (if (distance from earline to the nose/(ear distance) > 0.25?)
+        # 3. Check ears, nose, "collinear" (if (distance from earline to the nose/(ear distance) > 0.25?)
             if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
                 ear_dist = dist(l_ear[:-1], r_ear[:-1])
                 ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
                 ear_nose_offset = ear_nose_dist/ear_dist
-                cv2.putText(image, f"Ear Offset: {ear_nose_offset:.2f}", (25, image.shape[0] - 30*reduc),
+                cv2.putText(image, f"Ear Offset: {ear_nose_offset:.2f}", (25, int(image.shape[0] - 30*reduc)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, (0, 67, 255), 2)
                 if (ear_nose_dist/ear_dist) < 0.25:
                     return True
@@ -117,38 +146,14 @@ def process_frame(results, frame, conf_thresh=0.7, reduc=1):
                     (67,255,67),
                     1)
 
-CAMERA_NUMBER = "approachable.mov"
-
-# ==========================================================
-# Flask Configuration
-# ==========================================================
-app = Flask(__name__)
-
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Gaze Detector Stream</title>
-</head>
-<body>
-    <h1 style="text-align:center;">Gaze Detector Stream</h1>
-    <div style="display: flex; justify-content: center; margin: 10px;">
-        <img src="/video_feed" width="960">
-    </div>
-</body>
-</html>
-"""
-
-# Global variable to safely hold the latest processed frame JPEG bytes across threads
-latest_frame_bytes = None
-frame_lock = threading.Lock()
-
 # ==========================================================
 # ROS 2 Node
 # ==========================================================
 class CameraPublisher(Node):
 
     def __init__(self):
+        
+        self.prev = time.time()
         super().__init__("camera_publisher")
         
         self.publisher = self.create_publisher(Image, "/camera/image_annotated", 10)
@@ -169,56 +174,70 @@ class CameraPublisher(Node):
             return
 
         # Timer to capture and process frames at ~10 FPS
-        self.timer = self.create_timer(1.0 / 10.0, self.process_and_publish) # 10 FPS
+        self.timer = self.create_timer(1.0 / 10, self.process_and_publish) # 10 FPS
         self.get_logger().info("Camera Node initialized successfully.")
 
     def process_and_publish(self):
         global latest_frame_bytes
+        global time_elapsed 
 
-        success, frame = self.cap.read()
-        if not success:
-            self.get_logger().warning("Failed to read camera frame")
-            return
+        time_elapsed = time.time() - self.prev
+        if (IS_ORIGINAL_FPS or time_elapsed > 1.0 / FRAME_RATE):
+            self.prev = time.time()
+            success, frame = self.cap.read()
+            if not success:
+                self.get_logger().warning("Failed to read camera frame")
+                return
 
-        h, w = frame.shape[:2]
+            h, w = frame.shape[:2]
 
-        # Resize if factor is modified
-        if self.IMG_REDUC_FACTOR != 1:
-            h, w = int(h * self.IMG_REDUC_FACTOR), int(w * self.IMG_REDUC_FACTOR)
-            frame = cv2.resize(frame, (w, h))
+            # Resize if factor is modified
+            if self.IMG_REDUC_FACTOR != 1:
+                h, w = int(h * self.IMG_REDUC_FACTOR), int(w * self.IMG_REDUC_FACTOR)
+                frame = cv2.resize(frame, (w, h))
 
-        # Split frame for independent top/bottom inference
-        top_frame = frame[:h//2, :]
-        bottom_frame = frame[h//2:, :]
+            # Split frame for independent top/bottom inference
+            top_frame = frame[:h//2, :]
+            # bottom_frame = frame[h//2:, :]
 
-        top_results = self.model(top_frame, verbose=False, classes=[0])[0]
-        bottom_results = self.model(bottom_frame, verbose=False, classes=[0])[0]
+            start = time.time()
+            #TODO: see whether limiting subjects is necessary (max_det = N)
+            top_results = self.model(top_frame, verbose=False, classes=[0])[0]
+            print("YOLO:", time.time() - start)
 
-        # Run helper processing if available
-        if process_frame:
-            process_frame(top_results, top_frame, conf_thresh=self.CONF_THRESHOLD, reduc=self.IMG_REDUC_FACTOR)
-            process_frame(bottom_results, bottom_frame, conf_thresh=self.CONF_THRESHOLD, reduc=self.IMG_REDUC_FACTOR)
+            # top_results = self.model(top_frame, verbose=False, classes=[0])[0]
+            # bottom_results = self.model(bottom_frame, verbose=False, classes=[0])[0]
+
+            # Run helper processing if available
+            if process_frame:
+                process_frame(top_results, top_frame, conf_thresh=self.CONF_THRESHOLD, reduc=self.IMG_REDUC_FACTOR)
+                # process_frame(bottom_results, bottom_frame, conf_thresh=self.CONF_THRESHOLD, reduc=self.IMG_REDUC_FACTOR)
+            else:
+                # Fallback visuals if helper isn't present
+                cv2.putText(frame, "YOLO Active", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            # Re-stitch frames together
+            frame = top_frame
+            # frame = np.vstack((top_frame, bottom_frame))
+
+            # 1. Update the Flask stream buffer (Thread Safe)
+            ret, buffer = cv2.imencode(".jpg", frame)
+            if ret:
+                with frame_lock:
+                    latest_frame_bytes = buffer.tobytes()
+
+            # 2. Publish to ROS 2 Topic
+            try:
+                msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = "camera"
+                self.publisher.publish(msg)
+            except Exception as e:
+                self.get_logger().error(f"Failed to publish image: {str(e)}")
         else:
-            # Fallback visuals if helper isn't present
-            cv2.putText(frame, "YOLO Active", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        # Re-stitch frames together
-        frame = np.vstack((top_frame, bottom_frame))
-
-        # 1. Update the Flask stream buffer (Thread Safe)
-        ret, buffer = cv2.imencode(".jpg", frame)
-        if ret:
-            with frame_lock:
-                latest_frame_bytes = buffer.tobytes()
-
-        # 2. Publish to ROS 2 Topic
-        try:
-            msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = "camera"
-            self.publisher.publish(msg)
-        except Exception as e:
-            self.get_logger().error(f"Failed to publish image: {str(e)}")
+            # Prevent hot-spin while waiting for next frame/time budget.
+            # Without this, the loop burns CPU doing no useful work.
+            time.sleep(0.001)
 
     def destroy_node(self):
         if self.cap.isOpened():
@@ -236,15 +255,20 @@ def generate_frames():
     """Generator function that pulls the latest frame bytes for Flask."""
     global latest_frame_bytes
     while True:
-        with frame_lock:
-            if latest_frame_bytes is None:
-                continue
-            frame = latest_frame_bytes
-        
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-        )
+        if (IS_ORIGINAL_FPS or time_elapsed > 1.0 / FRAME_RATE):
+            with frame_lock:
+                if latest_frame_bytes is None:
+                    continue
+                frame = latest_frame_bytes
+            
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
+        else:
+            # Prevent hot-spin while waiting for next frame/time budget.
+            # Without this, the loop burns CPU doing no useful work.
+            time.sleep(0.001)
 
 @app.route("/video_feed")
 def video_feed():

@@ -1,7 +1,7 @@
 import cv2
 import time
 import numpy as np
-import joblib
+import joblib, pickle
 from flask import Flask, Response, render_template_string
 from math import dist
 from ultralytics import YOLO
@@ -15,16 +15,23 @@ IS_360 = False
 GAZE_MODEL = True
 IMG_REDUC_FACTOR = 0.6
 MORE_ANNOTATIONS = False
-
-# Load models safely
-model = YOLO("yolov8n-pose.pt") 
-
+# TODO: Add smoothing algorithm for noisy/fickle results
+model = YOLO("yolo26n-pose.pt") 
 classifier = None
 scaler = None
+
 if GAZE_MODEL:
     try:
-        classifier = joblib.load('gaze_classifier_2.joblib')
-        scaler = joblib.load('gaze_scaler_2.joblib')
+        # ⭐️ BEST MODEL: Gradient Boosting 2param: Nose, Ear-Nose Offset)
+                    # GB/RF NENl: Nose, Ear Offsets + Nose-Eyeline Ratio
+                    # RF v77: Validation Accuracy = 77% (highest, but in practice worse)
+        with open('models/gb_gaze_classifier_2param.pkl', 'rb') as f:
+            classifier = pickle.load(f)
+
+        with open('models/gb_gaze_scaler_2param.pkl', 'rb') as f:
+            scaler = pickle.load(f)
+        # classifier = joblib.load('models/rf_gaze_classifier_v77.joblib')
+        # scaler = joblib.load('models/rf_gaze_scaler_v77.joblib')
     except Exception as e:
         print(f"Error loading Gaze Model components: {e}")
 
@@ -33,8 +40,6 @@ cap = cv2.VideoCapture(CAMERA_NUMBER)
 if not cap.isOpened():
     print(f"\n[CRITICAL ERROR] Cannot open video source: '{CAMERA_NUMBER}'")
     print("Ensure the file exists, the path is correct, or try using a webcam integer like 0.\n")
-
-face_names = ["Nose", "L Eye", "R Eye", "L Ear", "R Ear"]
 
 # ========================================================== #
 # Flask App
@@ -53,41 +58,85 @@ HTML = """
 </html>
 """
 
-def predict_local_image(face_kp):
-    if classifier is None or scaler is None:
-        return False
-    face_flat = np.array(face_kp).flatten().reshape(1, -1)
-    scaled_kp = scaler.transform(face_flat)
-    prediction = classifier.predict(scaled_kp)[0]
-    return (prediction == 1)
-
 def distance_point_to_line(p1, p2, p3):
     line_vec = p2 - p1
     point_vec = p3 - p1
     line_vec_3d = np.array([line_vec[0], line_vec[1], 0.0])
     point_vec_3d = np.array([point_vec[0], point_vec[1], 0.0])
     norm = np.linalg.norm(line_vec_3d)
-    if norm == 0:
-        return 0
-    return abs(np.cross(line_vec_3d, point_vec_3d)[2]) / norm
+    return 0 if norm == 0 else abs(np.cross(line_vec_3d, point_vec_3d)[2]) / norm
 
-def check_approachability(keypoints, image, conf_thresh=0.7):
+def predict_local_image(face_kp, conf_thresh=0.7):
+    """
+    Expects face_kp to be an array/list of shape (5, 3) 
+    containing [x, y, confidence] for Nose, L-Eye, R-Eye, L-Ear, R-Ear.
+    """
+    if classifier is None or scaler is None:
+        return False
+        
+    kp = np.array(face_kp)
+    if len(kp) < 5:
+        return False
+
+    nose, l_eye, r_eye, l_ear, r_ear = kp[0], kp[1], kp[2], kp[3], kp[4]
+
+    # 0. Is Nose visible?
+    if nose[2] < conf_thresh:
+        return False
+
+    nose_eyes_offset = -1.0
+    ear_nose_offset = -1.0
+
+    # 1. Calculate Nose-to-Eyes Horizontal Offset
+    if l_eye[2] > conf_thresh and r_eye[2] > conf_thresh:
+        eye_center_x = (l_eye[0] + r_eye[0]) / 2.0
+        eye_distance = np.abs(l_eye[0] - r_eye[0])
+        
+        if eye_distance > 0:
+            nose_eyes_offset = np.abs(nose[0] - eye_center_x) / eye_distance
+
+    # 2. Calculate Ear-to-Nose Perpendicular Offset
+    if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
+        ear_dist = dist(l_ear[:-1], r_ear[:-1])
+        ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
+
+        if ear_dist > 0:
+            ear_nose_offset = ear_nose_dist / ear_dist
+
+    # 3. Calculate Nose-Eyeline Ratio
+    l_eye_nose_dist = (l_eye[0] - nose[0])
+    r_eye_nose_dist = (r_eye[0] - nose[0])
+    nose_eyeline_ratio = abs(l_eye_nose_dist/r_eye_nose_dist)
+
+    # 4. Number of Ears visible
+    num_ears = 0
+    if r_ear[2] > 0.8:
+        num_ears+=1
+    if l_ear[2] > 0.8:
+        num_ears+=1
+
+    # 5. Scale & Predict
+
+    # feature_vector = np.array([nose_eyes_offset, ear_nose_offset, nose_eyeline_ratio]).reshape(1,-1)
+    feature_vector = np.array([nose_eyes_offset, ear_nose_offset]).reshape(1, -1)
+
+    scaled_kp = scaler.transform(feature_vector)
+    prediction = classifier.predict(scaled_kp)[0]
+    
+    return (prediction == 1)
+
+def check_approachability(kp, image, conf_thresh=0.7):
     """
     Baseline Behavior Layer: Evaluates if a person is looking towards the camera 
     from a high angle / top-down perspective.
     """
-    nose = keypoints[0]
-    l_eye = keypoints[1]
-    r_eye = keypoints[2]
-    l_ear = keypoints[3]
-    r_ear = keypoints[4]
+    nose, l_eye, r_eye, l_ear, r_ear = kp[0], kp[1], kp[2], kp[3], kp[4]
     
-    # 1. Is nose visible?
-    # [x, y, confidence]
+    # 0. Is nose visible?
     if nose[2] < conf_thresh:
         return False
         
-    # 2. Is nose relatively centered betwixt eyes?
+    # 1. Calculate Nose-to-Eyes Horizontal Offset
     if l_eye[2] > conf_thresh and r_eye[2] > conf_thresh:
         eye_center_x = (l_eye[0] + r_eye[0]) / 2
         eye_distance = abs(l_eye[0] - r_eye[0])
@@ -100,7 +149,7 @@ def check_approachability(keypoints, image, conf_thresh=0.7):
                 cv2.putText(image, f"Nose Offset: {nose_eyes_offset:.2f}", (25, image.shape[0] - 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.67, (255, 255, 0), 4)
             
-        # 3. Check ears, nose, "collinear" (if (distance from earline to the nose/(ear distance) > 0.25?)
+        # 2. Calculate Ear-to-Nose Perpendicular Offset
             if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
                 ear_dist = dist(l_ear[:-1], r_ear[:-1])
                 ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
@@ -130,8 +179,7 @@ def process_frame(results, frame, conf_thresh=0.7):
             face_kpts = kpts[0:5]
             
             if GAZE_MODEL:
-                face_kp = [sublist[:-1] for sublist in face_kpts]
-                approachable = predict_local_image(face_kp)
+                approachable = predict_local_image(face_kpts)
             else:
                 approachable = check_approachability(face_kpts, frame, conf_thresh=conf_thresh)
             
@@ -187,11 +235,10 @@ def generate_frames():
             h, w = int(h * IMG_REDUC_FACTOR), int(w * IMG_REDUC_FACTOR)
             frame = cv2.resize(frame, (w, h))
 
-        if IS_360:
-            # Enforce an even slice layout split to preserve shape constraints across channels
+        if IS_360: # Split frame into dual 180 views
             half_h = h // 2
             top_frame = frame[:half_h, :]
-            bottom_frame = frame[half_h:(half_h * 2), :] # Guarantees exact structural matching dimensions
+            bottom_frame = frame[half_h:(half_h * 2), :]
             
             top_results = model(top_frame, verbose=False, classes=[0])[0]
             bottom_results = model(bottom_frame, verbose=False, classes=[0])[0]

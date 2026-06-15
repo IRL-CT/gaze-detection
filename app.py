@@ -9,11 +9,12 @@ from ultralytics import YOLO
 # ========================================================== #
 # Configuration
 # ========================================================== #
-CAMERA_NUMBER = 0
-CONF_THRESHOLD = 0.7
+CAMERA_NUMBER = "test_videos/test.mov"
+
 IS_360 = False
-IMG_REDUC_FACTOR = 0.6
 GAZE_MODEL = True
+IMG_REDUC_FACTOR = 0.6
+MORE_ANNOTATIONS = False
 
 # Load models safely
 model = YOLO("yolov8n-pose.pt") 
@@ -22,8 +23,8 @@ classifier = None
 scaler = None
 if GAZE_MODEL:
     try:
-        classifier = joblib.load('gaze_classifier.joblib')
-        scaler = joblib.load('gaze_scaler.joblib')
+        classifier = joblib.load('gaze_classifier_2.joblib')
+        scaler = joblib.load('gaze_scaler_2.joblib')
     except Exception as e:
         print(f"Error loading Gaze Model components: {e}")
 
@@ -93,19 +94,23 @@ def check_approachability(keypoints, image, conf_thresh=0.7):
         
         if eye_distance > 0:
             nose_eyes_offset = abs(nose[0] - eye_center_x) / eye_distance
-            cv2.putText(image, f"Nose Offset: {nose_eyes_offset:.2f}", (25, image.shape[0] - 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.67, (255, 255, 0), 4)
             if nose_eyes_offset > 0.15: 
                 return False
+            if MORE_ANNOTATIONS:
+                cv2.putText(image, f"Nose Offset: {nose_eyes_offset:.2f}", (25, image.shape[0] - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.67, (255, 255, 0), 4)
+            
         # 3. Check ears, nose, "collinear" (if (distance from earline to the nose/(ear distance) > 0.25?)
             if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
                 ear_dist = dist(l_ear[:-1], r_ear[:-1])
                 ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
                 ear_nose_offset = ear_nose_dist/ear_dist
-                cv2.putText(image, f"Ear Offset: {ear_nose_offset:.2f}", (25, image.shape[0] - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.67, (0, 67, 255), 4)
-                if (ear_nose_dist/ear_dist) < 0.25:
+                if ear_nose_offset < 0.25:
                     return True
+                if MORE_ANNOTATIONS:
+                    cv2.putText(image, f"Ear Offset: {ear_nose_offset:.2f}", (25, image.shape[0] - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.67, (0, 67, 255), 4)
+                
             else:
                 return True
                 
@@ -113,7 +118,10 @@ def check_approachability(keypoints, image, conf_thresh=0.7):
 
 def process_frame(results, frame, conf_thresh=0.7):
     if results.keypoints is not None and len(results.keypoints.xy) > 0:
-        boxes = results.boxes.xyxy.cpu().numpy()
+        boxes = []
+        for box in results.boxes:
+            if box.conf.item() > conf_thresh:
+                boxes.append(box.xyxy.cpu().numpy()[0])
         kpts_list = results.keypoints.data.cpu().numpy()
         
         for index, kpts in enumerate(kpts_list):
@@ -131,15 +139,25 @@ def process_frame(results, frame, conf_thresh=0.7):
             bbox = [float(x) for x in boxes[index]]
             
             color = (0, 255, 0) if approachable else (0, 0, 255)
-            status = "APPROACHABLE" if approachable else "DNI"
+            status = "APPROACH" if approachable else "DNI"
             
-            cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.67, color, 2)
+            cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+
+            # for box in results.boxes:
+            #     conf_value = box.conf.item() 
+            #     cv2.putText( frame, f"{conf_value:.2f}", (int(bbox[0])+10, int(bbox[1])-10),
+            #                 cv2.FONT_HERSHEY_SIMPLEX, 0.67, (255,0,255), 1)
             
-            for pt in face_serialized:
-                x, y, conf = pt[0], pt[1], pt[2]
-                if conf > conf_thresh:
-                    cv2.circle(frame, (int(x), int(y)), 4, (255, 255, 0), -1)
+            if MORE_ANNOTATIONS:
+                for pt in face_serialized:
+                    x, y, conf = pt[0], pt[1], pt[2]
+                    if conf > conf_thresh:
+                        cv2.circle(frame, (int(x), int(y)), 4, (255, 255, 0), -1)
+                        # cv2.putText( frame, f"({x:.2f}, {y:.2f})", (int(x)+5, int(y)-5), 
+                        # cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+                        # cv2.putText( frame, f"{conf:.2f}", (int(x)+5, int(y)-20),
+                        # cv2.FONT_HERSHEY_SIMPLEX, 0.67, (67,255,67), 1)
 
 # ========================================================== #
 # Frame Generator
@@ -178,12 +196,12 @@ def generate_frames():
             top_results = model(top_frame, verbose=False, classes=[0])[0]
             bottom_results = model(bottom_frame, verbose=False, classes=[0])[0]
             
-            process_frame(top_results, top_frame, conf_thresh=CONF_THRESHOLD)
-            process_frame(bottom_results, bottom_frame, conf_thresh=CONF_THRESHOLD)
+            process_frame(top_results, top_frame)
+            process_frame(bottom_results, bottom_frame)
             frame = np.vstack((top_frame, bottom_frame))
         else:
             results = model(frame, verbose=False, classes=[0])[0]
-            process_frame(results, frame, conf_thresh=CONF_THRESHOLD)
+            process_frame(results, frame)
 
         ret, buffer = cv2.imencode(".jpg", frame)
         if not ret:

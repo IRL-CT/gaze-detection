@@ -3,7 +3,6 @@ __pycache__/
 *.pth
 *.onnx
 *.mp4
-*.mov
 *.avi
 venv/
 old/

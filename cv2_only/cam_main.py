@@ -3,14 +3,14 @@ import cv2
 import time
 import numpy as np
 from ultralytics import YOLO
-from cv2_only.cam_main_helpers import process_frame
+from cam_main_helpers import process_frame
 
 # Load real-time YOLO Pose model (Nano version recommended for speed)
 model = YOLO('yolo26n-pose.pt')
 
 CAMERA_NUMBER = 0 # 0 or 1 for WebCam
 CONF_THRESHOLD = 0.7
-IS_360 = True
+IS_360 = False
 IMG_REDUC_FACTOR = 0.6
 
 cap = cv2.VideoCapture(CAMERA_NUMBER)

@@ -17,10 +17,14 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --no-cache-dir \
     "numpy<2" \
     flask \
-    ultralytics
+    ultralytics \
+    scikit-learn
+    
+# 4. upgrade 
+# RUN pip3 install --upgrade numpy scikit-learn
 
 # 4. workspace
 WORKDIR /ros2_ws
 COPY . /ros2_ws
 
-CMD ["bash", "-c", "source /opt/ros/humble/setup.bash && python3 -u pub.py"]
+CMD ["bash", "-c", "source /opt/ros/humble/setup.bash && python3 -u pub_stream.py"]

@@ -14,10 +14,11 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
-CAMERA_NUMBER = "approachable.mov"
+CAMERA_NUMBER = "test.mov"
 # CAMERA_NUMBER = 0
 IS_ORIGINAL_FPS = False
 FRAME_RATE = 100
+MORE_ANNOTATIONS = False
 
 # ==========================================================
 # Flask Configuration
@@ -44,19 +45,12 @@ latest_frame_bytes = None
 frame_lock = threading.Lock()
 
 def distance_point_to_line(p1, p2, p3):
-    """
-    Calculates the distance from point p3 to the line defined by p1 and p2.
-    Points should be passed as numpy arrays, e.g., np.array([x, y])
-    """
-
     line_vec = p2 - p1
     point_vec = p3 - p1
-    
-    # Perpendicular distance formula via 2D cross product & norm
-    line_vec = np.array([line_vec[0], line_vec[1], 0.0])
-    point_vec = np.array([point_vec[0], point_vec[1], 0.0])
-
-    return abs(np.cross(line_vec, point_vec)) / np.linalg.norm(line_vec)
+    line_vec_3d = np.array([line_vec[0], line_vec[1], 0.0])
+    point_vec_3d = np.array([point_vec[0], point_vec[1], 0.0])
+    norm = np.linalg.norm(line_vec_3d)
+    return 0 if norm == 0 else abs(np.cross(line_vec_3d, point_vec_3d)[2]) / norm
 
 def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
     """
@@ -108,53 +102,13 @@ def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
         num_ears+=1
 
     # 5. Scale & Predict
-
-    # feature_vector = np.array([nose_eyes_offset, ear_nose_offset, nose_eyeline_ratio]).reshape(1,-1)
-    feature_vector = np.array([nose_eyes_offset, ear_nose_offset]).reshape(1, -1)
+    feature_vector = np.array([nose_eyes_offset, ear_nose_offset, nose_eyeline_ratio]).reshape(1,-1)
+    # feature_vector = np.array([nose_eyes_offset, ear_nose_offset]).reshape(1, -1)
 
     scaled_kp = scaler.transform(feature_vector)
     prediction = classifier.predict(scaled_kp)[0]
     
     return (prediction == 1)
-
-def check_approachability(keypoints, image, conf_thresh=0.7, reduc=1):
-    """
-    Baseline Behavior Layer: Evaluates if a person is looking towards the camera 
-    from a high angle / top-down perspective.
-    """
-
-    nose = keypoints[0]
-    l_eye = keypoints[1]
-    r_eye = keypoints[2]
-    l_ear = keypoints[3]
-    r_ear = keypoints[4]
-    
-    # 1. Is nose visible?
-    if nose[2] < conf_thresh:
-        return False
-        
-    # 2. Is nose relatively centered betwixt eyes?
-    if l_eye[2] > conf_thresh and r_eye[2] > conf_thresh:
-        eye_center_x = (l_eye[0] + r_eye[0]) / 2
-        eye_distance = abs(l_eye[0] - r_eye[0])
-        
-        if eye_distance > 0:
-            nose_eyes_offset = abs(nose[0] - eye_center_x) / eye_distance
-            cv2.putText(image, f"Nose Offset: {nose_eyes_offset:.2f}", (25, int(image.shape[0] - 50*reduc)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, (255, 255, 0), 2)
-            if nose_eyes_offset > 0.15: 
-                return False
-        # 3. Check ears, nose, "collinear" (if (distance from earline to the nose/(ear distance) > 0.25?)
-            if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
-                ear_dist = dist(l_ear[:-1], r_ear[:-1])
-                ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
-                ear_nose_offset = ear_nose_dist/ear_dist
-                cv2.putText(image, f"Ear Offset: {ear_nose_offset:.2f}", (25, int(image.shape[0] - 30*reduc)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, (0, 67, 255), 2)
-                if (ear_nose_dist/ear_dist) < 0.25:
-                    return True
-                
-    return False
 
 def process_frame(classifier, scaler, results, frame, conf_thresh=0.7, reduc=1):
     processed_data = []
@@ -185,20 +139,21 @@ def process_frame(classifier, scaler, results, frame, conf_thresh=0.7, reduc=1):
             })
             
             color = (0, 255, 0) if approachable else (0, 0, 255)
-            status = "APPROACH" if approachable else "DNI"
 
-            cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, color, 2)
-                
             cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
 
-            for idx, pt in enumerate(face_serialized):
-                if pt[2] > conf_thresh:
-                    cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (255, 255, 0), -1)
-                        # cv2.putText( frame, f"({pt[0]:.2f}, {pt[1]:.2f})", (int(pt[0])+5, int(pt[1])-5), 
-                        # cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
-                        # cv2.putText( frame, f"{conf:.2f}", (int(pt[0])+5, int(pt[1])-20),
-                        # cv2.FONT_HERSHEY_SIMPLEX, 0.67, (67,255,67), 1)
+            if MORE_ANNOTATIONS:
+                status = "APPROACH" if approachable else "DNI"
+                cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, color, 2)
+                
+                for pt in face_serialized:
+                    if pt[2] > conf_thresh:
+                        cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (255, 255, 0), -1)
+                            # cv2.putText( frame, f"({pt[0]:.2f}, {pt[1]:.2f})", (int(pt[0])+5, int(pt[1])-5), 
+                            # cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+                            # cv2.putText( frame, f"{conf:.2f}", (int(pt[0])+5, int(pt[1])-20),
+                            # cv2.FONT_HERSHEY_SIMPLEX, 0.67, (67,255,67), 1)
 
 # ==========================================================
 # ROS 2 Node
@@ -225,10 +180,10 @@ class CameraPublisher(Node):
         self.scaler = None
 
         # TODO: generalize filepaths?
-        with open('models/gb_gaze_classifier_2param.pkl', 'rb') as f:
+        with open('models/gb_gaze_classifier_3param_ros.pkl', 'rb') as f:
             self.classifier = pickle.load(f)
 
-        with open('models/gb_gaze_scaler_2param.pkl', 'rb') as f:
+        with open('models/gb_gaze_scaler_3param_ros.pkl', 'rb') as f:
             self.scaler = pickle.load(f)
         # classifier = joblib.load('models/rf_gaze_classifier_v77.joblib')
         # scaler = joblib.load('models/rf_gaze_scaler_v77.joblib')
@@ -270,7 +225,7 @@ class CameraPublisher(Node):
             start = time.time()
             #TODO: see whether limiting subjects is necessary (max_det = N)
             top_results = self.model(top_frame, verbose=False, classes=[0])[0]
-            print("YOLO:", time.time() - start)
+            # print("YOLO:", time.time() - start)
 
             # top_results = self.model(top_frame, verbose=False, classes=[0])[0]
             # bottom_results = self.model(bottom_frame, verbose=False, classes=[0])[0]

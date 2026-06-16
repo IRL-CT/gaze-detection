@@ -1,4 +1,7 @@
 # Gaze Detection Models, Features
+Predicts when pedestrian is engaging with camera based on facial keypoints via binary classification. 
+
+Deploys browser site to livestream predictions via Flask (`app.py` for deployment from PC, `ros_web_docker/pub_stream.py` for deployment with ROS publishing).
 
 ## Total Features List
 - A. Nose-Eye Offset

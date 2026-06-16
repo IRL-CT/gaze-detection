@@ -4,19 +4,37 @@ import time
 import numpy as np
 from ultralytics import YOLO
 from cam_main_helpers import process_frame
+import joblib, pickle
 
 # Load real-time YOLO Pose model (Nano version recommended for speed)
 model = YOLO('yolo26n-pose.pt')
+classifier = None
+scaler = None
 
-CAMERA_NUMBER = 0 # 0 or 1 for WebCam
+CAMERA_NUMBER = 1 # 0 or 1 for WebCam
+
 CONF_THRESHOLD = 0.7
 IS_360 = False
 IMG_REDUC_FACTOR = 0.6
+GAZE_MODEL = True
 
 cap = cv2.VideoCapture(CAMERA_NUMBER)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 cv2.namedWindow("Stream", cv2.WINDOW_NORMAL)
+
+if GAZE_MODEL: # See README.md
+    try:
+        # BEST MODEL: gb_gaze_XXX_2param.pkl
+        with open('models/gb_gaze_classifier_2param.pkl', 'rb') as f:
+            classifier = pickle.load(f)
+
+        with open('models/gb_gaze_scaler_2param.pkl', 'rb') as f:
+            scaler = pickle.load(f)
+        # classifier = joblib.load('models/rf_gaze_classifier_v77.joblib')
+        # scaler = joblib.load('models/rf_gaze_scaler_v77.joblib')
+    except Exception as e:
+        print(f"Error loading Gaze Model components: {e}")
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -44,8 +62,8 @@ while cap.isOpened():
     frame_timestamp = time.time()
 
     if IS_360:
-        process_frame(top_results, top_frame, conf_thresh=CONF_THRESHOLD)
-        process_frame(bottom_results, bottom_frame, conf_thresh=CONF_THRESHOLD)
+        process_frame(top_results, top_frame, conf_thresh=CONF_THRESHOLD, is_gaze_model=GAZE_MODEL, classifier=classifier, scaler=scaler)
+        process_frame(bottom_results, bottom_frame, conf_thresh=CONF_THRESHOLD, is_gaze_model=GAZE_MODEL, classifier=classifier, scaler=scaler)
         combined_vertical = np.vstack((top_frame, bottom_frame))
         cv2.imshow("Stream", combined_vertical)
     else:

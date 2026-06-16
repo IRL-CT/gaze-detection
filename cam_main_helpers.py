@@ -56,7 +56,66 @@ def check_approachability(keypoints, image, conf_thresh=0.7):
                 
     return False
 
-def process_frame(results, frame, conf_thresh=0.7):
+def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
+    """
+    Expects face_kp to be an array/list of shape (5, 3) 
+    containing [x, y, confidence] for Nose, L-Eye, R-Eye, L-Ear, R-Ear.
+    """
+    if classifier is None or scaler is None:
+        return False
+        
+    kp = np.array(face_kp)
+    if len(kp) < 5:
+        return False
+
+    nose, l_eye, r_eye, l_ear, r_ear = kp[0], kp[1], kp[2], kp[3], kp[4]
+
+    # 0. Is Nose visible?
+    if nose[2] < conf_thresh:
+        return False
+
+    nose_eyes_offset = -1.0
+    ear_nose_offset = -1.0
+
+    # 1. Calculate Nose-to-Eyes Horizontal Offset
+    if l_eye[2] > conf_thresh and r_eye[2] > conf_thresh:
+        eye_center_x = (l_eye[0] + r_eye[0]) / 2.0
+        eye_distance = np.abs(l_eye[0] - r_eye[0])
+        
+        if eye_distance > 0:
+            nose_eyes_offset = np.abs(nose[0] - eye_center_x) / eye_distance
+
+    # 2. Calculate Ear-to-Nose Perpendicular Offset
+    if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
+        ear_dist = dist(l_ear[:-1], r_ear[:-1])
+        ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
+
+        if ear_dist > 0:
+            ear_nose_offset = ear_nose_dist / ear_dist
+
+    # 3. Calculate Nose-Eyeline Ratio
+    l_eye_nose_dist = (l_eye[0] - nose[0])
+    r_eye_nose_dist = (r_eye[0] - nose[0])
+    nose_eyeline_ratio = abs(l_eye_nose_dist/r_eye_nose_dist)
+
+    # 4. Number of Ears visible
+    num_ears = 0
+    if r_ear[2] > 0.8:
+        num_ears+=1
+    if l_ear[2] > 0.8:
+        num_ears+=1
+
+    # 5. Scale & Predict
+
+    # feature_vector = np.array([nose_eyes_offset, ear_nose_offset, nose_eyeline_ratio]).reshape(1,-1)
+    feature_vector = np.array([nose_eyes_offset, ear_nose_offset]).reshape(1, -1)
+
+    scaled_kp = scaler.transform(feature_vector)
+    prediction = classifier.predict(scaled_kp)[0]
+    
+    return (prediction == 1)
+
+def process_frame(results, frame, conf_thresh=0.7, is_gaze_model=False, classifier=None, scaler=None):
     processed_data = []
     face_names = ["Nose", "L Eye", "R Eye", "L Ear", "R Ear"]
     if results.keypoints is not None:
@@ -66,8 +125,11 @@ def process_frame(results, frame, conf_thresh=0.7):
 
         for index, kpts in enumerate(kpts_list):
             face_kpts = kpts[0:5] 
-            
-            approachable = check_approachability(face_kpts, frame, conf_thresh = conf_thresh)
+
+            if is_gaze_model:
+                approachable = predict_local_image(classifier, scaler, face_kpts)
+            else:
+                approachable = check_approachability(face_kpts, frame, conf_thresh = conf_thresh)
             
             face_serialized = [[float(x), float(y), float(conf)] for x, y, conf in face_kpts]
             bbox = [float(x) for x in boxes[index]]

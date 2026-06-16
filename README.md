@@ -1,4 +1,5 @@
 # Gaze Detection Models, Features
+Use cv2 to process and display annotated frames, with model and hardcoded features mode.
 
 ## Total Features List
 - A. Nose-Eye Offset

@@ -20,11 +20,9 @@ model = YOLO("yolo26n-pose.pt")
 classifier = None
 scaler = None
 
-if GAZE_MODEL:
+if GAZE_MODEL: # See README.md
     try:
-        # ⭐️ BEST MODEL: Gradient Boosting 2param: Nose, Ear-Nose Offset)
-                    # GB/RF NENl: Nose, Ear Offsets + Nose-Eyeline Ratio
-                    # RF v77: Validation Accuracy = 77% (highest, but in practice worse)
+        # BEST MODEL: gb_gaze_XXX_2param.pkl
         with open('models/gb_gaze_classifier_2param.pkl', 'rb') as f:
             classifier = pickle.load(f)
 

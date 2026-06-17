@@ -143,7 +143,7 @@ def smooth_process_frame(classifier, scaler, results, frame):
             boxes.append(box.xyxy.cpu().numpy()[0])
     kpts_list = results.keypoints.data.cpu().numpy()
     
-    processed_data = []
+    # processed_data = []
     new_tracks = {}
 
     for index, kpts in enumerate(kpts_list):
@@ -197,12 +197,12 @@ def smooth_process_frame(classifier, scaler, results, frame):
             approachable = predict_local_image(classifier, scaler, face_kpts)
 
         # TODO: Check if helpful data
-        processed_data.append({
-            "person_id": index,
-            "bbox": bbox,
-            "face_keypoints": face_serialized,
-            "approachable": approachable
-        })
+        # processed_data.append({
+        #     "person_id": index,
+        #     "bbox": bbox,
+        #     "face_keypoints": face_serialized,
+        #     "approachable": approachable
+        # })
 
         # Draw overlays
         color = (0, 255, 0) if approachable else (0, 0, 255)
@@ -304,7 +304,7 @@ class CameraPublisher(Node):
                 msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
                 msg.header.stamp = self.get_clock().now().to_msg()
                 msg.header.frame_id = "camera"
-                self.publisher.publish(msg)
+                self.publisher.publish(msg) # Publish image to ROS topic /camera/image_annotated
             except Exception as e:
                 self.get_logger().error(f"Failed to publish image: {str(e)}")
         else:

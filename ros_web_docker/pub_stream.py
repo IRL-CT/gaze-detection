@@ -6,6 +6,7 @@ import threading
 import numpy as np
 import time
 import pickle
+# import joblib
 from ultralytics import YOLO
 from flask import Flask, Response, render_template_string
 from math import dist
@@ -14,11 +15,26 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
-CAMERA_NUMBER = "test.mov"
+CAMERA_NUMBER = "test.mov"      # [0..2] or path to video
+DUAL = False                    # True to isolate top view (faster processing)
 # CAMERA_NUMBER = 0
+
 IS_ORIGINAL_FPS = False
-FRAME_RATE = 100
+FRAME_RATE = 30
 MORE_ANNOTATIONS = False
+SMOOTHING = False
+
+IMG_REDUC_FACTOR = 0.5
+CONF_THRESHOLD = 0.7
+
+# SMOOTHING
+# Tuning Parameters
+ALPHA = 0.35          # Running average weight (0.35 current frame, 0.65 history)
+DISTANCE_THRESH = 80  # Max pixels a person's face box can move between frames
+
+# Structure: { person_id: { 'bbox': [x1,y1,x2,y2], 'smoothed_state': True/False/Float } }
+active_tracks = {}
+next_track_id = 0
 
 # ==========================================================
 # Flask Configuration
@@ -45,6 +61,9 @@ latest_frame_bytes = None
 frame_lock = threading.Lock()
 
 def distance_point_to_line(p1, p2, p3):
+    """
+    Calculate distance from line created by [p1, p2] to p3.
+    """
     line_vec = p2 - p1
     point_vec = p3 - p1
     line_vec_3d = np.array([line_vec[0], line_vec[1], 0.0])
@@ -52,7 +71,7 @@ def distance_point_to_line(p1, p2, p3):
     norm = np.linalg.norm(line_vec_3d)
     return 0 if norm == 0 else abs(np.cross(line_vec_3d, point_vec_3d)[2]) / norm
 
-def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
+def predict_local_image(classifier, scaler, face_kp):
     """
     Expects face_kp to be an array/list of shape (5, 3) 
     containing [x, y, confidence] for Nose, L-Eye, R-Eye, L-Ear, R-Ear.
@@ -67,14 +86,14 @@ def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
     nose, l_eye, r_eye, l_ear, r_ear = kp[0], kp[1], kp[2], kp[3], kp[4]
 
     # 0. Is Nose visible?
-    if nose[2] < conf_thresh:
+    if nose[2] < CONF_THRESHOLD:
         return False
 
     nose_eyes_offset = -1.0
     ear_nose_offset = -1.0
 
     # 1. Calculate Nose-to-Eyes Horizontal Offset
-    if l_eye[2] > conf_thresh and r_eye[2] > conf_thresh:
+    if l_eye[2] > CONF_THRESHOLD and r_eye[2] > CONF_THRESHOLD:
         eye_center_x = (l_eye[0] + r_eye[0]) / 2.0
         eye_distance = np.abs(l_eye[0] - r_eye[0])
         
@@ -82,7 +101,7 @@ def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
             nose_eyes_offset = np.abs(nose[0] - eye_center_x) / eye_distance
 
     # 2. Calculate Ear-to-Nose Perpendicular Offset
-    if l_ear[2] > conf_thresh and r_ear[2] > conf_thresh:
+    if l_ear[2] > CONF_THRESHOLD and r_ear[2] > CONF_THRESHOLD:
         ear_dist = dist(l_ear[:-1], r_ear[:-1])
         ear_nose_dist = distance_point_to_line(l_ear[:-1], r_ear[:-1], nose[:-1])
 
@@ -110,50 +129,91 @@ def predict_local_image(classifier, scaler, face_kp, conf_thresh=0.7):
     
     return (prediction == 1)
 
-def process_frame(classifier, scaler, results, frame, conf_thresh=0.7, reduc=1):
+def smooth_process_frame(classifier, scaler, results, frame):
+    global active_tracks, next_track_id
+
+    if results.keypoints is None or len(results.keypoints.xy) == 0:
+        # Clear history if the frame is completely empty to save memory
+        active_tracks = {}
+        return
+    
+    boxes = []
+    for box in results.boxes:
+        if box.conf.item() > CONF_THRESHOLD:
+            boxes.append(box.xyxy.cpu().numpy()[0])
+    kpts_list = results.keypoints.data.cpu().numpy()
+    
     processed_data = []
-    # Filter out low confidence detections
-    if results.keypoints is not None and len(results.keypoints.xy) > 0:
-        boxes = []
-        for box in results.boxes:
-            if box.conf.item() > conf_thresh:
-                boxes.append(box.xyxy.cpu().numpy()[0])
-        kpts_list = results.keypoints.data.cpu().numpy()
+    new_tracks = {}
 
-        for index, kpts in enumerate(kpts_list):
-            if index >= len(boxes):
-                break
-            face_kpts = kpts[0:5]
-            
-            approachable = predict_local_image(classifier, scaler, face_kpts)
-            
-            face_serialized = [[float(x), float(y), float(conf)] for x, y, conf in face_kpts]
-            bbox = [float(x) for x in boxes[index]]
-            
-            # TODO: Check if helpful data
-            processed_data.append({
-                "person_id": index,
-                "bbox": bbox,
-                "face_keypoints": face_serialized,
-                "approachable": approachable
-            })
-            
-            color = (0, 255, 0) if approachable else (0, 0, 255)
+    for index, kpts in enumerate(kpts_list):
+        if index >= len(boxes):
+            break
+        face_kpts = kpts[0:5]
+        face_serialized = [[float(x), float(y), float(conf)] for x, y, conf in face_kpts]
+        bbox = [float(x) for x in boxes[index]]
 
-            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+        if SMOOTHING:
+            # Calculate center of current bounding box
+            current_center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+            
+            # Get raw frame-by-frame calculation
+            raw_val = float(predict_local_image(classifier, scaler, face_kpts)) # 1.0 for True, 0.0 for False
 
-            if MORE_ANNOTATIONS:
-                status = "APPROACH" if approachable else "DNI"
-                cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.67*reduc, color, 2)
+            matched_id = None
+            min_dist = float('inf')
+
+            # Spatial Matching: Find the closest person from the LAST frame
+            for tid, tdata in active_tracks.items():
+                last_bbox = tdata['bbox']
+                last_center = np.array([(last_bbox[0] + last_bbox[2]) / 2, (last_bbox[1] + last_bbox[3]) / 2])
                 
-                for pt in face_serialized:
-                    if pt[2] > conf_thresh:
-                        cv2.circle(frame, (int(pt[0]), int(pt[1])), 4, (255, 255, 0), -1)
-                            # cv2.putText( frame, f"({pt[0]:.2f}, {pt[1]:.2f})", (int(pt[0])+5, int(pt[1])-5), 
-                            # cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
-                            # cv2.putText( frame, f"{conf:.2f}", (int(pt[0])+5, int(pt[1])-20),
-                            # cv2.FONT_HERSHEY_SIMPLEX, 0.67, (67,255,67), 1)
+                dist = np.linalg.norm(current_center - last_center)
+                if dist < min_dist and dist < DISTANCE_THRESH:
+                    min_dist = dist
+                    matched_id = tid
+
+            # If no match near this location, assume it's a new person entering the cafe
+            if matched_id is None:
+                matched_id = next_track_id
+                next_track_id += 1
+                smoothed_val = raw_val
+            else:
+                # Apply the Running Average (EMA formula)
+                # smoothed = (alpha * current) + ((1 - alpha) * history)
+                prior_val = active_tracks[matched_id]['smoothed_state']
+                smoothed_val = (ALPHA * raw_val) + ((1.0 - ALPHA) * prior_val)
+
+            # Save to current frame state
+            new_tracks[matched_id] = {
+                'bbox': bbox,
+                'smoothed_state': smoothed_val
+            }
+
+        # Threshold the running average back to a binary decision
+        # If the running average climbs above 0.5, they are looking!
+            approachable = smoothed_val > 0.5 
+        else:
+            approachable = predict_local_image(classifier, scaler, face_kpts)
+
+        # TODO: Check if helpful data
+        processed_data.append({
+            "person_id": index,
+            "bbox": bbox,
+            "face_keypoints": face_serialized,
+            "approachable": approachable
+        })
+
+        # Draw overlays
+        color = (0, 255, 0) if approachable else (0, 0, 255)
+        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+
+        if MORE_ANNOTATIONS and SMOOTHING:
+            status = f"APPROACH ({smoothed_val:.2f})" if approachable else f"DNI ({smoothed_val:.2f})"
+            cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5*IMG_REDUC_FACTOR, color, 2)
+
+    # Swap history: Keep only people seen in this exact frame
+    active_tracks = new_tracks
 
 # ==========================================================
 # ROS 2 Node
@@ -168,10 +228,6 @@ class CameraPublisher(Node):
         self.publisher = self.create_publisher(Image, "/camera/image_annotated", 10)
         self.bridge = CvBridge()
         
-        # Configuration
-        self.IMG_REDUC_FACTOR = 0.5
-        self.CONF_THRESHOLD = 0.8
-        
         # Initialize camera and models
         self.get_logger().info("Initializing YOLO model and Camera...")
         self.model = YOLO("yolo26n-pose.pt")
@@ -185,8 +241,8 @@ class CameraPublisher(Node):
 
         with open('models/gb_gaze_scaler_3param_ros.pkl', 'rb') as f:
             self.scaler = pickle.load(f)
-        # classifier = joblib.load('models/rf_gaze_classifier_v77.joblib')
-        # scaler = joblib.load('models/rf_gaze_scaler_v77.joblib')
+        # classifier = joblib.load('models/gaze_classifier.joblib')
+        # scaler = joblib.load('models/gaze_classifier.joblib')
 
         self.cap = cv2.VideoCapture(CAMERA_NUMBER)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -195,8 +251,8 @@ class CameraPublisher(Node):
             self.get_logger().error(f"Could not open camera index {CAMERA_NUMBER}")
             return
 
-        # Timer to capture and process frames at ~10 FPS
-        self.timer = self.create_timer(1.0 / 10, self.process_and_publish) # 10 FPS
+        # Timer to capture and process frames at ~2 FPS
+        self.timer = self.create_timer(1.0 / 2, self.process_and_publish) # 2 FPS
         self.get_logger().info("Camera Node initialized successfully.")
 
     def process_and_publish(self):
@@ -214,33 +270,28 @@ class CameraPublisher(Node):
             h, w = frame.shape[:2]
 
             # Resize if factor is modified
-            if self.IMG_REDUC_FACTOR != 1:
-                h, w = int(h * self.IMG_REDUC_FACTOR), int(w * self.IMG_REDUC_FACTOR)
+            if IMG_REDUC_FACTOR != 1:
+                h, w = int(h * IMG_REDUC_FACTOR), int(w * IMG_REDUC_FACTOR)
                 frame = cv2.resize(frame, (w, h))
 
             # Split frame for independent top/bottom inference
             top_frame = frame[:h//2, :]
-            # bottom_frame = frame[h//2:, :]
-
-            start = time.time()
-            #TODO: see whether limiting subjects is necessary (max_det = N)
             top_results = self.model(top_frame, verbose=False, classes=[0])[0]
-            # print("YOLO:", time.time() - start)
-
-            # top_results = self.model(top_frame, verbose=False, classes=[0])[0]
-            # bottom_results = self.model(bottom_frame, verbose=False, classes=[0])[0]
+            if DUAL:
+                bottom_frame = frame[h//2:, :]
+                bottom_results = self.model(bottom_frame, verbose=False, classes=[0])[0]
 
             # Run helper processing if available
-            if process_frame:
-                process_frame(self.classifier, self.scaler, top_results, top_frame, conf_thresh=self.CONF_THRESHOLD, reduc=self.IMG_REDUC_FACTOR)
-                # process_frame(self.classifier, self.scaler, bottom_results, bottom_frame, conf_thresh=self.CONF_THRESHOLD, reduc=self.IMG_REDUC_FACTOR)
+            if smooth_process_frame:
+                smooth_process_frame(self.classifier, self.scaler, top_results, top_frame)
+                if DUAL:
+                    smooth_process_frame(self.classifier, self.scaler, bottom_results, bottom_frame)
             else:
                 # Fallback visuals if helper isn't present
                 cv2.putText(frame, "YOLO Active", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
             # Re-stitch frames together
-            frame = top_frame
-            # frame = np.vstack((top_frame, bottom_frame))
+            frame = np.vstack((top_frame, bottom_frame)) if DUAL else top_frame
 
             # 1. Update the Flask stream buffer (Thread Safe)
             ret, buffer = cv2.imencode(".jpg", frame)

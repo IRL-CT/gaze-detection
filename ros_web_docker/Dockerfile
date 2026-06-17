@@ -18,7 +18,8 @@ RUN pip3 install --no-cache-dir \
     "numpy<2" \
     flask \
     ultralytics \
-    scikit-learn
+    scikit-learn \
+    joblib
     
 # 4. upgrade 
 # RUN pip3 install --upgrade numpy scikit-learn

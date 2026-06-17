@@ -33,7 +33,7 @@ Deploys browser site to livestream predictions via Flask (`app.py` for deploymen
 <!-- - Features: Nose-Eye, Ear-Nose Offsets, Nose-Eyeline Ratio. -->
 
 ## RF v77: Random Forest
-- VA: 77%
+- VA: 78%
 
 - Features: A, B
     - Highest accuracy, but in practice worse; flickers often.

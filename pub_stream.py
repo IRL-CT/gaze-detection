@@ -272,8 +272,9 @@ def smooth_process_frame(classifier, scaler, results, frame):
     # Coast tracks that weren't matched this frame so brief detection gaps don't
     # reset their smoothed state; drop them once they've been missing too long.
     if SMOOTHING:
-        bbox = [float(x) for x in boxes[top_index]]
-        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255,255,255), 2)
+        if top_index < len(boxes):
+            bbox = [float(x) for x in boxes[top_index]]
+            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255,255,255), 2)
 
         for tid, tdata in active_tracks.items():
             if tid in new_tracks:

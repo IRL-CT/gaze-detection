@@ -6,6 +6,7 @@ import signal
 import threading
 import numpy as np
 import time
+import json
 import pickle
 import os
 import torch
@@ -16,6 +17,7 @@ from math import dist
 
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 
 # Resolve paths relative to this file so the node runs from any working dir.
@@ -181,6 +183,10 @@ def smooth_process_frame(classifier, scaler, results, frame):
 
     new_tracks = {}
     matched_ids = set()
+    detections = []  # Per-person results returned to the caller for ROS publishing
+    
+    top_index = 0
+    top_smoothed_val = 0
 
     for index, kpts in enumerate(kpts_list):
         if index >= len(boxes):
@@ -243,17 +249,32 @@ def smooth_process_frame(classifier, scaler, results, frame):
                 'missed': 0,
             }
 
+            top_smoothed_val = smoothed_val if smoothed_val > top_smoothed_val and approachable else top_smoothed_val
+
         # Draw overlays
         color = (0, 255, 0) if approachable else (0, 0, 255)
         cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+        
 
         if MORE_ANNOTATIONS and SMOOTHING:
             status = f"APPROACH ({smoothed_val:.2f})" if approachable else f"DNI ({smoothed_val:.2f})"
-            cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5*IMG_REDUC_FACTOR, color, 2)
+            cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.85*IMG_REDUC_FACTOR, color, 1)
+
+        # Collect this person's result for publishing. id is the stable track id
+        # when smoothing, else the per-frame detection index.
+        detections.append({
+            "id": int(matched_id) if SMOOTHING else int(index),
+            "bbox": [round(float(v), 1) for v in bbox],
+            "approachable": bool(approachable),
+            "smoothed_state": round(float(smoothed_val), 3) if smoothed_val is not None else None,
+        })
 
     # Coast tracks that weren't matched this frame so brief detection gaps don't
     # reset their smoothed state; drop them once they've been missing too long.
     if SMOOTHING:
+        bbox = [float(x) for x in boxes[top_index]]
+        cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (255,255,255), 2)
+
         for tid, tdata in active_tracks.items():
             if tid in new_tracks:
                 continue
@@ -261,6 +282,8 @@ def smooth_process_frame(classifier, scaler, results, frame):
             if tdata['missed'] <= TRACK_TTL:
                 new_tracks[tid] = tdata
         active_tracks = new_tracks
+
+    return detections
 
 # ==========================================================
 # ROS 2 Node
@@ -273,6 +296,8 @@ class CameraPublisher(Node):
         super().__init__("camera_publisher")
         
         self.publisher = self.create_publisher(Image, "/camera/image_annotated", 10)
+        # Per-person gaze results as a JSON string (no custom msg package needed).
+        self.gaze_publisher = self.create_publisher(String, "/camera/gaze_data", 10)
         self.bridge = CvBridge()
         
         # Initialize camera and models
@@ -347,10 +372,16 @@ class CameraPublisher(Node):
                                             device=DEVICE, half=USE_HALF)[0]
 
             # Run helper processing if available
+            detections = []
             if smooth_process_frame:
-                smooth_process_frame(self.classifier, self.scaler, top_results, top_frame)
+                detections = smooth_process_frame(self.classifier, self.scaler, top_results, top_frame)
                 if DUAL:
-                    smooth_process_frame(self.classifier, self.scaler, bottom_results, bottom_frame)
+                    bottom_dets = smooth_process_frame(self.classifier, self.scaler, bottom_results, bottom_frame)
+                    # Shift bottom-half boxes back into full-frame coordinates.
+                    for det in bottom_dets:
+                        det["bbox"][1] += h // 2
+                        det["bbox"][3] += h // 2
+                    detections.extend(bottom_dets)
             else:
                 # Fallback visuals if helper isn't present
                 cv2.putText(frame, "YOLO Active", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -370,8 +401,22 @@ class CameraPublisher(Node):
                 msg.header.stamp = self.get_clock().now().to_msg()
                 msg.header.frame_id = "camera"
                 self.publisher.publish(msg) # Publish image to ROS topic /camera/image_annotated
+
+                # 3. Publish per-person gaze results to /camera/gaze_data as JSON.
+                gaze_msg = String()
+                gaze_msg.data = json.dumps({
+                    "stamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                    "smoothing": SMOOTHING,
+                    "people": detections,
+                })
+                self.gaze_publisher.publish(gaze_msg)
             except Exception as e:
-                self.get_logger().error(f"Failed to publish image: {str(e)}")
+                # During Ctrl+C the context can be torn down between the rclpy.ok()
+                # check above and this publish, raising "publisher's context is
+                # invalid". That's a benign shutdown race, not a real failure, so
+                # only surface the error while the context is still valid.
+                if rclpy.ok():
+                    self.get_logger().error(f"Failed to publish image: {str(e)}")
         else:
             # Prevent hot-spin while waiting for next frame/time budget.
             # Without this, the loop burns CPU doing no useful work.

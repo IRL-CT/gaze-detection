@@ -6,6 +6,8 @@ import threading
 import numpy as np
 import time
 import pickle
+import os
+import torch
 # import joblib
 from ultralytics import YOLO
 from flask import Flask, Response, render_template_string
@@ -15,17 +17,30 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
-CAMERA_NUMBER = "test.mov"      # [0..2] or path to video
-DUAL = False                    # True to isolate top view (faster processing)
+# Resolve paths relative to this file so the node runs from any working dir.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
+
+# [0..2] for a live camera, or a path to a video file.
+CAMERA_NUMBER = os.path.join(PROJECT_DIR, "test_videos", "test.mov")
 # CAMERA_NUMBER = 0
+DUAL = False                    # True to isolate top view (faster processing)
+
+# YOLO model + inference device
+MODEL_PATH = os.path.join(SCRIPT_DIR, "yolo11n-pose.pt")
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+USE_HALF = torch.cuda.is_available()   # FP16 inference is a free speedup on Jetson GPU
 
 IS_ORIGINAL_FPS = False
 FRAME_RATE = 30
 MORE_ANNOTATIONS = False
-SMOOTHING = False
+SMOOTHING = True
 
 IMG_REDUC_FACTOR = 0.5
 CONF_THRESHOLD = 0.7
+
+# Set before the first frame is processed so the Flask generator never hits a NameError.
+time_elapsed = 0.0
 
 # SMOOTHING
 # Tuning Parameters
@@ -111,6 +126,10 @@ def predict_local_image(classifier, scaler, face_kp):
     # 3. Calculate Nose-Eyeline Ratio
     l_eye_nose_dist = (l_eye[0] - nose[0])
     r_eye_nose_dist = (r_eye[0] - nose[0])
+    # Guard against a nose horizontally aligned with the right eye (0 denominator),
+    # which would yield inf/NaN and crash the scaler downstream.
+    if r_eye_nose_dist == 0:
+        return False
     nose_eyeline_ratio = abs(l_eye_nose_dist/r_eye_nose_dist)
 
     # 4. Number of Ears visible
@@ -229,17 +248,23 @@ class CameraPublisher(Node):
         self.bridge = CvBridge()
         
         # Initialize camera and models
-        self.get_logger().info("Initializing YOLO model and Camera...")
-        self.model = YOLO("yolo26n-pose.pt")
+        self.get_logger().info(f"Initializing YOLO model on '{DEVICE}' and Camera...")
+        self.model = YOLO(MODEL_PATH)
+        self.model.to(DEVICE)
+        # Warm up the GPU graph so the first real frame isn't slow.
+        self.model(np.zeros((64, 64, 3), dtype=np.uint8),
+                   device=DEVICE, half=USE_HALF, verbose=False)
+        self.get_logger().info(f"YOLO model loaded: {os.path.basename(MODEL_PATH)} on {DEVICE}")
 
         self.classifier = None
         self.scaler = None
 
-        # TODO: generalize filepaths?
-        with open('models/gb_gaze_classifier_3param_ros.pkl', 'rb') as f:
+        clf_path = os.path.join(SCRIPT_DIR, 'models', 'gb_gaze_classifier_3param_ros.pkl')
+        scl_path = os.path.join(SCRIPT_DIR, 'models', 'gb_gaze_scaler_3param_ros.pkl')
+        with open(clf_path, 'rb') as f:
             self.classifier = pickle.load(f)
 
-        with open('models/gb_gaze_scaler_3param_ros.pkl', 'rb') as f:
+        with open(scl_path, 'rb') as f:
             self.scaler = pickle.load(f)
         # classifier = joblib.load('models/gaze_classifier.joblib')
         # scaler = joblib.load('models/gaze_classifier.joblib')
@@ -251,8 +276,9 @@ class CameraPublisher(Node):
             self.get_logger().error(f"Could not open camera index {CAMERA_NUMBER}")
             return
 
-        # Timer to capture and process frames at ~2 FPS
-        self.timer = self.create_timer(1.0 / 2, self.process_and_publish) # 2 FPS
+        # Drive capture/inference at the target frame rate (GPU keeps up; the
+        # FRAME_RATE gate inside the callback throttles actual work).
+        self.timer = self.create_timer(1.0 / FRAME_RATE, self.process_and_publish)
         self.get_logger().info("Camera Node initialized successfully.")
 
     def process_and_publish(self):
@@ -264,7 +290,11 @@ class CameraPublisher(Node):
             self.prev = time.time()
             success, frame = self.cap.read()
             if not success:
-                self.get_logger().warning("Failed to read camera frame")
+                # Loop video files; for a live camera this is a transient read miss.
+                if isinstance(CAMERA_NUMBER, str):
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                else:
+                    self.get_logger().warning("Failed to read camera frame")
                 return
 
             h, w = frame.shape[:2]
@@ -275,11 +305,13 @@ class CameraPublisher(Node):
                 frame = cv2.resize(frame, (w, h))
 
             # Split frame for independent top/bottom inference
-            top_frame = frame[:h//2, :]
-            top_results = self.model(top_frame, verbose=False, classes=[0])[0]
+            top_frame = frame[:h//2, :] if DUAL else frame
+            top_results = self.model(top_frame, verbose=False, classes=[0],
+                                     device=DEVICE, half=USE_HALF)[0]
             if DUAL:
                 bottom_frame = frame[h//2:, :]
-                bottom_results = self.model(bottom_frame, verbose=False, classes=[0])[0]
+                bottom_results = self.model(bottom_frame, verbose=False, classes=[0],
+                                            device=DEVICE, half=USE_HALF)[0]
 
             # Run helper processing if available
             if smooth_process_frame:
@@ -325,23 +357,26 @@ def index():
     return render_template_string(HTML)
 
 def generate_frames():
-    """Generator function that pulls the latest frame bytes for Flask."""
+    """Generator function that pulls the latest frame bytes for Flask.
+
+    Only emits when a *new* frame is available (each processed frame is a fresh
+    bytes object), so we don't flood the client with duplicate JPEGs.
+    """
     global latest_frame_bytes
+    last_sent = None
     while True:
-        if (IS_ORIGINAL_FPS or time_elapsed > 1.0 / FRAME_RATE):
-            with frame_lock:
-                if latest_frame_bytes is None:
-                    continue
-                frame = latest_frame_bytes
-            
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            )
-        else:
-            # Prevent hot-spin while waiting for next frame/time budget.
-            # Without this, the loop burns CPU doing no useful work.
-            time.sleep(0.001)
+        with frame_lock:
+            frame = latest_frame_bytes
+        if frame is None or frame is last_sent:
+            # No new frame yet; yield CPU/bandwidth instead of hot-spinning.
+            time.sleep(0.005)
+            continue
+        last_sent = frame
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        )
 
 @app.route("/video_feed")
 def video_feed():
@@ -368,10 +403,16 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # Cleanup
-        node.get_logger().info("Shutting down cleanly...")
-        node.destroy_node()
-        rclpy.shutdown()
+        # Fast, clean shutdown. The /video_feed route is an endless generator and
+        # the ROS executor runs in a daemon thread, so a "polite" teardown can hang
+        # for seconds waiting on them. Release the camera (the one resource the OS
+        # won't reclaim cleanly on its own), then hard-exit and let the OS reap the
+        # rest (sockets, daemon threads, GPU context) instantly.
+        node.get_logger().info("Shutting down...")
+        cap = getattr(node, "cap", None)
+        if cap is not None and cap.isOpened():
+            cap.release()
+        os._exit(0)
 
 if __name__ == "__main__":
     main()

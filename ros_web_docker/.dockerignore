@@ -1,9 +1,0 @@
-__pycache__/
-*.pt
-*.pth
-*.onnx
-*.mp4
-*.avi
-.vscode/
-.git/
-venv/

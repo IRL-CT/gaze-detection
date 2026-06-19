@@ -10,13 +10,14 @@ from ultralytics import YOLO
 # Configuration
 # ========================================================== #
 CAMERA_NUMBER = "test_videos/test.mov"
+CAMERA_NUMBER = 2
 
 IS_360 = False
 GAZE_MODEL = True
 IMG_REDUC_FACTOR = 0.6
 MORE_ANNOTATIONS = False
 # TODO: Add smoothing algorithm for noisy/fickle results
-model = YOLO("yolo26n-pose.pt") 
+model = YOLO("yolo11n-pose.pt") 
 classifier = None
 scaler = None
 

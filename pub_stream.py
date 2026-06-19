@@ -2,6 +2,7 @@
 
 import cv2
 import rclpy
+import signal
 import threading
 import numpy as np
 import time
@@ -22,7 +23,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
 # [0..2] for a live camera, or a path to a video file.
-CAMERA_NUMBER = os.path.join(PROJECT_DIR, "test_videos", "test.mov")
+# CAMERA_NUMBER = os.path.join(PROJECT_DIR, "test_videos", "test.mov")
+CAMERA_NUMBER = 2
 # CAMERA_NUMBER = 0
 DUAL = False                    # True to isolate top view (faster processing)
 
@@ -32,7 +34,7 @@ DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 USE_HALF = torch.cuda.is_available()   # FP16 inference is a free speedup on Jetson GPU
 
 IS_ORIGINAL_FPS = False
-FRAME_RATE = 30
+FRAME_RATE = 30 if not IS_ORIGINAL_FPS else 100
 MORE_ANNOTATIONS = False
 SMOOTHING = True
 
@@ -283,7 +285,12 @@ class CameraPublisher(Node):
 
     def process_and_publish(self):
         global latest_frame_bytes
-        global time_elapsed 
+        global time_elapsed
+
+        # Bail out once the context is shutting down so we don't publish into an
+        # invalid context (the source of the "Failed to publish image" errors on Ctrl+C).
+        if not rclpy.ok():
+            return
 
         time_elapsed = time.time() - self.prev
         if (IS_ORIGINAL_FPS or time_elapsed > 1.0 / FRAME_RATE):
@@ -396,23 +403,31 @@ def main():
     ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
 
-    try:
-        # Run Flask on the main thread
-        # threaded=True allows handling multiple web clients seamlessly
-        app.run(host="0.0.0.0", port=5050, threaded=True, debug=False)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        # Fast, clean shutdown. The /video_feed route is an endless generator and
-        # the ROS executor runs in a daemon thread, so a "polite" teardown can hang
-        # for seconds waiting on them. Release the camera (the one resource the OS
-        # won't reclaim cleanly on its own), then hard-exit and let the OS reap the
-        # rest (sockets, daemon threads, GPU context) instantly.
+    def shutdown(signum=None, frame=None):
+        # Fast, clean shutdown. rclpy.init() installs its own SIGINT handler that
+        # can swallow Ctrl+C before werkzeug ever sees it, leaving the Flask server
+        # (and port 5050) alive while the ROS context tears down underneath it.
+        # We override that handler here so Ctrl+C reliably reaches this teardown.
+        # The /video_feed route is an endless generator and the ROS executor runs
+        # in a daemon thread, so a "polite" teardown can hang for seconds waiting
+        # on them. Stop ROS, release the camera (the one resource the OS won't
+        # reclaim cleanly), then hard-exit and let the OS reap the rest (sockets,
+        # daemon threads, GPU context) instantly.
         node.get_logger().info("Shutting down...")
+        if rclpy.ok():
+            rclpy.shutdown()  # stops the spin thread so its callbacks stop firing
         cap = getattr(node, "cap", None)
         if cap is not None and cap.isOpened():
             cap.release()
         os._exit(0)
+
+    # Override rclpy's handlers so Ctrl+C (and SIGTERM) reach our teardown.
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    # Run Flask on the main thread.
+    # threaded=True allows handling multiple web clients seamlessly
+    app.run(host="0.0.0.0", port=5050, threaded=True, debug=False)
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,6 @@
 __pycache__/
 *.pt
+!ros_web_docker/yolo26n-pose.pt
 *.pth
 *.onnx
 *.mp4

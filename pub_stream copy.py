@@ -20,11 +20,11 @@ from cv_bridge import CvBridge
 
 # Resolve paths relative to this file so the node runs from any working dir.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
 # [0..2] for a live camera, or a path to a video file.
-CAMERA_NUMBER = os.path.join(SCRIPT_DIR, "test_videos", "test.mov")
-# CAMERA_NUMBER = 2
-# CAMERA_NUMBER = "test_videos/test.mov"
+# CAMERA_NUMBER = os.path.join(PROJECT_DIR, "test_videos", "test.mov")
+CAMERA_NUMBER = 2
 # CAMERA_NUMBER = 0
 DUAL = False                    # True to isolate top view (faster processing)
 
@@ -35,7 +35,7 @@ USE_HALF = torch.cuda.is_available()   # FP16 inference is a free speedup on Jet
 
 IS_ORIGINAL_FPS = False
 FRAME_RATE = 30 if not IS_ORIGINAL_FPS else 100
-MORE_ANNOTATIONS = True
+MORE_ANNOTATIONS = False
 SMOOTHING = True
 
 IMG_REDUC_FACTOR = 0.5
@@ -46,18 +46,10 @@ time_elapsed = 0.0
 
 # SMOOTHING
 # Tuning Parameters
-ALPHA = 0.25          # EMA weight on the current frame (lower = smoother, more lag)
-DISTANCE_THRESH = 80  # Max px a person's box center can move between frames to match
+ALPHA = 0.35          # Running average weight (0.35 current frame, 0.65 history)
+DISTANCE_THRESH = 80  # Max pixels a person's face box can move between frames
 
-# Hysteresis: require strong, sustained evidence to flip state. A single 0.5
-# threshold chatters; these two create a "dead zone" the smoothed value must fully
-# cross before the label changes.
-ENTER_THRESH = 0.60   # smoothed prob must rise above this to become APPROACH
-EXIT_THRESH = 0.40    # ...and fall below this to drop back to DNI
-TRACK_TTL = 8         # frames to coast a track after it stops being detected
-
-# Structure: { person_id: {'bbox': [...], 'smoothed_state': float,
-#                          'approachable': bool, 'missed': int} }
+# Structure: { person_id: { 'bbox': [x1,y1,x2,y2], 'smoothed_state': True/False/Float } }
 active_tracks = {}
 next_track_id = 0
 
@@ -98,27 +90,21 @@ def distance_point_to_line(p1, p2, p3):
 
 def predict_local_image(classifier, scaler, face_kp):
     """
-    Expects face_kp to be an array/list of shape (5, 3)
+    Expects face_kp to be an array/list of shape (5, 3) 
     containing [x, y, confidence] for Nose, L-Eye, R-Eye, L-Ear, R-Ear.
-
-    Returns the probability in [0, 1] that the person is looking (approachable),
-    or None when there is no usable measurement (no model / malformed keypoints)
-    so the caller can hold the prior smoothed value instead of treating a missing
-    reading as "not looking".
     """
     if classifier is None or scaler is None:
-        return None
-
+        return False
+        
     kp = np.array(face_kp)
     if len(kp) < 5:
-        return None
+        return False
 
     nose, l_eye, r_eye, l_ear, r_ear = kp[0], kp[1], kp[2], kp[3], kp[4]
 
-    # 0. Is Nose visible? An absent frontal nose is evidence they are turned away,
-    #    so report 0.0 (not looking) rather than "no data".
+    # 0. Is Nose visible?
     if nose[2] < CONF_THRESHOLD:
-        return 0.0
+        return False
 
     nose_eyes_offset = -1.0
     ear_nose_offset = -1.0
@@ -145,7 +131,7 @@ def predict_local_image(classifier, scaler, face_kp):
     # Guard against a nose horizontally aligned with the right eye (0 denominator),
     # which would yield inf/NaN and crash the scaler downstream.
     if r_eye_nose_dist == 0:
-        return 0.0
+        return False
     nose_eyeline_ratio = abs(l_eye_nose_dist/r_eye_nose_dist)
 
     # 4. Number of Ears visible
@@ -160,88 +146,84 @@ def predict_local_image(classifier, scaler, face_kp):
     # feature_vector = np.array([nose_eyes_offset, ear_nose_offset]).reshape(1, -1)
 
     scaled_kp = scaler.transform(feature_vector)
-
-    # Return a continuous probability so the EMA smooths a soft signal instead of a
-    # noisy hard 0/1 (the main source of green/red flicker). Fall back to the binary
-    # decision if this classifier has no predict_proba.
-    if hasattr(classifier, "predict_proba"):
-        return float(classifier.predict_proba(scaled_kp)[0][1])
-    return float(classifier.predict(scaled_kp)[0] == 1)
+    prediction = classifier.predict(scaled_kp)[0]
+    
+    return (prediction == 1)
 
 def smooth_process_frame(classifier, scaler, results, frame):
     global active_tracks, next_track_id
 
+    if results.keypoints is None or len(results.keypoints.xy) == 0:
+        # Clear history if the frame is completely empty to save memory
+        active_tracks = {}
+        return
+    
     boxes = []
-    kpts_list = []
-    if results.keypoints is not None and len(results.keypoints.xy) > 0:
-        for box in results.boxes:
-            if box.conf.item() > CONF_THRESHOLD:
-                boxes.append(box.xyxy.cpu().numpy()[0])
-        kpts_list = results.keypoints.data.cpu().numpy()
-
+    for box in results.boxes:
+        if box.conf.item() > CONF_THRESHOLD:
+            boxes.append(box.xyxy.cpu().numpy()[0])
+    kpts_list = results.keypoints.data.cpu().numpy()
+    
+    # processed_data = []
     new_tracks = {}
-    matched_ids = set()
 
     for index, kpts in enumerate(kpts_list):
         if index >= len(boxes):
             break
         face_kpts = kpts[0:5]
+        face_serialized = [[float(x), float(y), float(conf)] for x, y, conf in face_kpts]
         bbox = [float(x) for x in boxes[index]]
-        smoothed_val = None
 
-        if not SMOOTHING:
-            prob = predict_local_image(classifier, scaler, face_kpts)
-            approachable = prob is not None and prob > 0.5
-        else:
+        if SMOOTHING:
+            # Calculate center of current bounding box
             current_center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+            
+            # Get raw frame-by-frame calculation
+            raw_val = float(predict_local_image(classifier, scaler, face_kpts)) # 1.0 for True, 0.0 for False
 
-            # Raw per-frame probability (None == no usable face this frame)
-            raw_prob = predict_local_image(classifier, scaler, face_kpts)
-
-            # Spatial matching: nearest still-unclaimed track from prior frames
             matched_id = None
             min_dist = float('inf')
+
+            # Spatial Matching: Find the closest person from the LAST frame
             for tid, tdata in active_tracks.items():
-                if tid in matched_ids:
-                    continue
                 last_bbox = tdata['bbox']
                 last_center = np.array([(last_bbox[0] + last_bbox[2]) / 2, (last_bbox[1] + last_bbox[3]) / 2])
-                d = np.linalg.norm(current_center - last_center)
-                if d < min_dist and d < DISTANCE_THRESH:
-                    min_dist = d
+                
+                dist = np.linalg.norm(current_center - last_center)
+                if dist < min_dist and dist < DISTANCE_THRESH:
+                    min_dist = dist
                     matched_id = tid
 
+            # If no match near this location, assume it's a new person entering the cafe
             if matched_id is None:
-                # New person entering the scene; seed the EMA with this reading
-                # (or a neutral 0.5 if we have no reading yet).
                 matched_id = next_track_id
                 next_track_id += 1
-                smoothed_val = raw_prob if raw_prob is not None else 0.5
-                approachable = smoothed_val > ENTER_THRESH
+                smoothed_val = raw_val
             else:
-                matched_ids.add(matched_id)
-                prior = active_tracks[matched_id]
-                if raw_prob is None:
-                    # No usable reading: coast on the prior value so a momentary
-                    # keypoint dropout doesn't yank the state around.
-                    smoothed_val = prior['smoothed_state']
-                else:
-                    # EMA: smoothed = alpha*current + (1-alpha)*history
-                    smoothed_val = (ALPHA * raw_prob) + ((1.0 - ALPHA) * prior['smoothed_state'])
+                # Apply the Running Average (EMA formula)
+                # smoothed = (alpha * current) + ((1 - alpha) * history)
+                prior_val = active_tracks[matched_id]['smoothed_state']
+                smoothed_val = (ALPHA * raw_val) + ((1.0 - ALPHA) * prior_val)
 
-                # Hysteresis: only flip the label when the smoothed value fully
-                # crosses the far threshold, so borderline values can't chatter.
-                if prior['approachable']:
-                    approachable = smoothed_val > EXIT_THRESH
-                else:
-                    approachable = smoothed_val > ENTER_THRESH
-
+            # Save to current frame state
             new_tracks[matched_id] = {
                 'bbox': bbox,
-                'smoothed_state': smoothed_val,
-                'approachable': approachable,
-                'missed': 0,
+                'smoothed_state': smoothed_val
             }
+
+        # Threshold the running average back to a binary decision
+        # If the running average climbs above 0.5, they are looking!
+            approachable = smoothed_val > 0.5 
+        else:
+            approachable = predict_local_image(classifier, scaler, face_kpts)
+
+        # TODO: Check if helpful data
+        # processed_data.append({
+        #     "person_id": index,
+        #     "bbox": bbox,
+        #     "face_keypoints": face_serialized,
+        #     "approachable": approachable
+        # })
 
         # Draw overlays
         color = (0, 255, 0) if approachable else (0, 0, 255)
@@ -251,16 +233,8 @@ def smooth_process_frame(classifier, scaler, results, frame):
             status = f"APPROACH ({smoothed_val:.2f})" if approachable else f"DNI ({smoothed_val:.2f})"
             cv2.putText(frame, status, (int(bbox[0]), int(bbox[1] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5*IMG_REDUC_FACTOR, color, 2)
 
-    # Coast tracks that weren't matched this frame so brief detection gaps don't
-    # reset their smoothed state; drop them once they've been missing too long.
-    if SMOOTHING:
-        for tid, tdata in active_tracks.items():
-            if tid in new_tracks:
-                continue
-            tdata['missed'] = tdata.get('missed', 0) + 1
-            if tdata['missed'] <= TRACK_TTL:
-                new_tracks[tid] = tdata
-        active_tracks = new_tracks
+    # Swap history: Keep only people seen in this exact frame
+    active_tracks = new_tracks
 
 # ==========================================================
 # ROS 2 Node
